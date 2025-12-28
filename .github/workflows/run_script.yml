@@ -1,13 +1,19 @@
-name: Hourly Album Sales Check
+name: High Frequency Album Sales Check
 
 on:
   schedule:
-    - cron: '0 * * * *'  # 每個小時整點跑一次
-  workflow_dispatch:      # 讓你可以手動點按鈕測試
+    # 這是每 5 分鐘跑一次的指令
+    - cron: '*/5 * * * *'  
+  workflow_dispatch:      # 讓手動按鈕繼續保留
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    # 防止前一次沒跑完，下一次就開始，造成試算表衝突
+    concurrency: 
+      group: monitor-group
+      cancel-in-progress: true
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
