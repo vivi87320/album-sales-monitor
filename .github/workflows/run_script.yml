@@ -1,0 +1,27 @@
+name: Hourly Album Sales Check
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # 每個小時整點跑一次
+  workflow_dispatch:      # 讓你可以手動點按鈕測試
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install gspread google-auth requests
+
+      - name: Run script
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+        run: python main.py
