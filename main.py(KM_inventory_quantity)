@@ -1,40 +1,34 @@
+import os
+import json
 import requests
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 from datetime import datetime
 import time
 import traceback
 
-# ===== 使用者設定 =====
-SHEET_ID = "1CIsh1bN92x7DlgHdsfohA2cJk13f5a-lWz2egVonYlk"
-JSON_CREDENTIALS_FILE = "credentials.json"
+# ===== 1. GitHub 安全認證設定 =====
+def get_gspread_client():
+    scopes = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    # 從 GitHub Secrets 讀取憑證內容
+    creds_json = os.environ.get('GOOGLE_CREDENTIALS')
+    if not creds_json:
+        raise ValueError("❌ 錯誤：找不到 GOOGLE_CREDENTIALS，請檢查 GitHub Secrets 設定！")
+    
+    creds_dict = json.loads(creds_json)
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    return gspread.authorize(creds)
 
-CHECK_INTERVAL = 180          # 每 3 分鐘檢查一次
-FORCE_WRITE_INTERVAL = 3600   # 每 1 小時強制寫入一次（秒）
-
-# === 商品 ===
-API_URL = "https://www.kmonstar.com.tw/products/%E6%87%89%E5%8B%9F-260111-ive-the-4th-ep-ive-secret-%E5%B0%88%E8%BC%AF%E7%99%BC%E8%A1%8C%E7%B4%80%E5%BF%B5%E8%A6%96%E8%A8%8A%E7%B0%BD%E5%90%8D%E6%9C%83.json"
-SHEET_NAME = "260111IVE視訊"
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Referer": "https://www.kmonstar.com.tw/"
-}
-
-# ---- Google Sheets 認證 ----
-scope = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive"
-]
-creds = ServiceAccountCredentials.from_json_keyfile_name(
-    JSON_CREDENTIALS_FILE, scope
-)
-client = gspread.authorize(creds)
-worksheet = client.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
-
-# ---- 抓 inventory_quantity ----
+# ===== 2. 抓取 Kmonstar 資料邏輯 =====
 def fetch_inventory(url):
-    r = requests.get(url, headers=HEADERS, timeout=20)
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.kmonstar.com.tw/"
+    }
+    r = requests.get(url, headers=headers, timeout=20)
     r.raise_for_status()
     data = r.json()
 
@@ -47,42 +41,68 @@ def fetch_inventory(url):
 
     return quantities, titles
 
-# ---- 寫入邏輯 ----
-def log_inventory(last_values, last_force_time):
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    now_ts = time.time()
+# ===== 3. 主程式邏輯 (GitHub Actions 模式) =====
+def main():
+    SHEET_ID = "1CIsh1bN92x7DlgHdsfohA2cJk13f5a-lWz2egVonYlk" # 你的試算表 ID
+    client = get_gspread_client()
+    sh = client.open_by_key(SHEET_ID)
 
+    # A. 從 Settings 分頁讀取要監測的網址清單
     try:
-        quantities, titles = fetch_inventory(API_URL)
-
-        # 建立表頭
-        if worksheet.cell(1, 1).value != "時間":
-            worksheet.append_row(["時間"] + titles)
-
-        force_write = now_ts - last_force_time >= FORCE_WRITE_INTERVAL
-
-        if last_values is None or quantities != last_values or force_write:
-            worksheet.append_row([now_str] + quantities)
-            print(f"[{now_str}] ✅ 寫入：{quantities}")
-            return quantities, now_ts
-        else:
-            print(f"[{now_str}] ⏳ 無變動")
-
+        settings_ws = sh.worksheet("Settings")
+        targets = settings_ws.get_all_records() # 抓取所有列，欄位需為「網址」和「分頁名稱」
     except Exception as e:
-        print(f"[{now_str}] ❌ 錯誤：{e}")
-        traceback.print_exc()
+        print(f"❌ 無法讀取 Settings 分頁: {e}")
+        return
 
-    return last_values, last_force_time
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    for target in targets:
+        api_url = target.get("網址")
+        sheet_name = target.get("分頁名稱")
 
-# ---- 主程式 ----
+        if not api_url or not sheet_name:
+            continue
+
+        print(f"🚀 正在處理: {sheet_name}")
+
+        try:
+            # 1. 抓取數據
+            quantities, titles = fetch_inventory(api_url)
+            
+            # 2. 開啟或建立對應的分頁
+            try:
+                worksheet = sh.worksheet(sheet_name)
+            except gspread.exceptions.WorksheetNotFound:
+                # 如果分頁不存在，就自動建立一個
+                worksheet = sh.add_worksheet(title=sheet_name, rows="100", cols="20")
+                print(f"🆕 已建立新分頁: {sheet_name}")
+
+            # 3. 檢查並建立表頭 (如果第一格是空的)
+            first_row = worksheet.row_values(1)
+            if not first_row or first_row[0] != "時間":
+                worksheet.insert_row(["時間"] + titles, 1)
+
+            # 4. 判斷是否需要寫入 (比對最後一行數據)
+            all_values = worksheet.get_all_values()
+            last_row = all_values[-1] if len(all_values) > 1 else None
+            
+            # 將目前數據轉為字串方便比對
+            current_data_strings = [str(q) for q in quantities]
+            
+            # 只有當數據與最後一行不同時，才寫入 (GitHub Actions 本身就一小時跑一次，不需強制寫入判斷)
+            if last_row is None or last_row[1:] != current_data_strings:
+                worksheet.append_row([now_str] + quantities)
+                print(f"✅ [{sheet_name}] 數據已更新：{quantities}")
+            else:
+                print(f"⏳ [{sheet_name}] 數據無變動，跳過")
+
+            # 禮貌性休息，避免被封鎖
+            time.sleep(2)
+
+        except Exception as e:
+            print(f"❌ 處理 {sheet_name} 時發生錯誤: {e}")
+            traceback.print_exc()
+
 if __name__ == "__main__":
-    print("🚀 啟動監測（3分鐘檢查 / 1小時強制寫入）")
-
-    last_values = None
-    last_force_time = time.time() - FORCE_WRITE_INTERVAL
-
-    while True:
-        last_values, last_force_time = log_inventory(
-            last_values, last_force_time
-        )
-        time.sleep(CHECK_INTERVAL)
+    main()
