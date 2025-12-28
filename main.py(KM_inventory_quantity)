@@ -1,0 +1,88 @@
+import requests
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from datetime import datetime
+import time
+import traceback
+
+# ===== 使用者設定 =====
+SHEET_ID = "1CIsh1bN92x7DlgHdsfohA2cJk13f5a-lWz2egVonYlk"
+JSON_CREDENTIALS_FILE = "credentials.json"
+
+CHECK_INTERVAL = 180          # 每 3 分鐘檢查一次
+FORCE_WRITE_INTERVAL = 3600   # 每 1 小時強制寫入一次（秒）
+
+# === 商品 ===
+API_URL = "https://www.kmonstar.com.tw/products/%E6%87%89%E5%8B%9F-260111-ive-the-4th-ep-ive-secret-%E5%B0%88%E8%BC%AF%E7%99%BC%E8%A1%8C%E7%B4%80%E5%BF%B5%E8%A6%96%E8%A8%8A%E7%B0%BD%E5%90%8D%E6%9C%83.json"
+SHEET_NAME = "260111IVE視訊"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Referer": "https://www.kmonstar.com.tw/"
+}
+
+# ---- Google Sheets 認證 ----
+scope = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive"
+]
+creds = ServiceAccountCredentials.from_json_keyfile_name(
+    JSON_CREDENTIALS_FILE, scope
+)
+client = gspread.authorize(creds)
+worksheet = client.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
+
+# ---- 抓 inventory_quantity ----
+def fetch_inventory(url):
+    r = requests.get(url, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+
+    quantities = []
+    titles = []
+
+    for v in data.get("variants", []):
+        titles.append(v.get("title", "無名"))
+        quantities.append(v.get("inventory_quantity"))
+
+    return quantities, titles
+
+# ---- 寫入邏輯 ----
+def log_inventory(last_values, last_force_time):
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_ts = time.time()
+
+    try:
+        quantities, titles = fetch_inventory(API_URL)
+
+        # 建立表頭
+        if worksheet.cell(1, 1).value != "時間":
+            worksheet.append_row(["時間"] + titles)
+
+        force_write = now_ts - last_force_time >= FORCE_WRITE_INTERVAL
+
+        if last_values is None or quantities != last_values or force_write:
+            worksheet.append_row([now_str] + quantities)
+            print(f"[{now_str}] ✅ 寫入：{quantities}")
+            return quantities, now_ts
+        else:
+            print(f"[{now_str}] ⏳ 無變動")
+
+    except Exception as e:
+        print(f"[{now_str}] ❌ 錯誤：{e}")
+        traceback.print_exc()
+
+    return last_values, last_force_time
+
+# ---- 主程式 ----
+if __name__ == "__main__":
+    print("🚀 啟動監測（3分鐘檢查 / 1小時強制寫入）")
+
+    last_values = None
+    last_force_time = time.time() - FORCE_WRITE_INTERVAL
+
+    while True:
+        last_values, last_force_time = log_inventory(
+            last_values, last_force_time
+        )
+        time.sleep(CHECK_INTERVAL)
